@@ -1,0 +1,12 @@
+# Local, per-user config (contains the network token / peer address)
+config.psd1
+machine.local.psd1
+
+# Runtime logs
+*.log
+
+# Editor / OS noise
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
