@@ -6,7 +6,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 **Global hotkeys that switch which computer each monitor shows, using DDC/CI over the video cables
-you already have.** Pure PowerShell with no third-party software. It uses the Windows `dxva2`
+you already have**, plus brightness, picture mode, colour and saved looks for both screens from a
+radial wheel (`Ctrl+Alt+Space`). Pure PowerShell with no third-party software. It uses the Windows `dxva2`
 Monitor Configuration API, `RegisterHotKey`, and plain TCP so two machines can coordinate.
 
 <!-- TODO: demo GIF of the monitors switching -->
