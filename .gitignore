@@ -1,6 +1,10 @@
 # Local, per-user config (contains the network token / peer address)
 config.psd1
 machine.local.psd1
+# Settings saved by profile toggles (e.g. Reading), per machine
+state.local.json
+# Saved looks + brightness calibration (machine-written; copy between your machines)
+saved.psd1
 
 # Runtime logs
 *.log
