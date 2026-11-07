@@ -24,14 +24,36 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LogPath   = Join-Path $ScriptDir 'ddc-hotkeys.log'
 . (Join-Path $ScriptDir 'ddc-lib.ps1')
 
-# The listener runspace and the peer sender write the same file, so retry briefly on a lock
-# rather than let a logging error kill the daemon.
-function Log([string]$msg) {
-    $line = "{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg
-    for ($i = 0; $i -lt 5; $i++) {
-        try { Add-Content -Path $LogPath -Value $line -Encoding UTF8 -ErrorAction Stop; return } catch { Start-Sleep -Milliseconds 20 }
+# Logging, forwarding and "run an action here and on the peer". Defined once and loaded both here
+# and in the worker runspace (below), which is where monitor actions actually run.
+$Shared = {
+    # The listener runspace, the worker and the peer sender write the same file, so retry briefly
+    # on a lock rather than let a logging error kill the daemon.
+    function Log([string]$msg) {
+        $line = "{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg
+        for ($i = 0; $i -lt 5; $i++) {
+            try { Add-Content -Path $LogPath -Value $line -Encoding UTF8 -ErrorAction Stop; return } catch { Start-Sleep -Milliseconds 20 }
+        }
+    }
+    function Send-ToPeer([string]$action) {
+        if (-not $NetworkEnabled) { return }
+        if (-not $PeerHost) { Log "no PeerHost set - not forwarding (edit machine.local.psd1)"; return }
+        [PeerSender]::Send($PeerHost, $Port, $Token, $action)
+    }
+    # Config is re-read per action, so presets/profiles can be edited without a restart.
+    function Invoke-Everywhere([string]$action, [string]$source) {
+        try {
+            Send-ToPeer $action                                                    # peer: monitors it owns (queued, in the background)
+            $results = Invoke-DdcAction -Action $action -Config (Import-Config)   # local: only monitors we own
+            Log ("{0} -> {1} (local): {2}" -f $source, $action, ($results -join ' | '))
+            return $results
+        } catch {
+            Log ("ERROR applying '{0}': {1}" -f $action, $_.Exception.Message)
+            return , ("Error: " + $_.Exception.Message)
+        }
     }
 }
+. $Shared
 
 # Single instance. The scheduled task fires on every logon, unlock and wake; if a daemon is
 # already running, this copy leaves quietly without touching the log, hotkeys or port.
@@ -72,6 +94,7 @@ using System.IO;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Threading;
 public class HotKeyApi {
     [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
@@ -114,6 +137,180 @@ public static class PeerSender {
         for (int i = 0; i < 5; i++) { try { File.AppendAllText(logPath, line); return; } catch (IOException) { Thread.Sleep(20); } }
     }
 }
+// Black windows over blanked monitors (Blank:On / Off / Toggle, see Switch-DdcBlank in ddc-lib.ps1).
+// Plain Win32 on its own thread, so they never depend on the hotkey loop or WPF. They swallow clicks
+// without taking focus and hide the cursor; double-click one to un-blank that monitor.
+public static class BlankOverlay {
+    delegate IntPtr WndProc(IntPtr h, uint m, IntPtr w, IntPtr l);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct WNDCLASSEX {
+        public uint cbSize; public uint style; public WndProc lpfnWndProc; public int cbClsExtra; public int cbWndExtra;
+        public IntPtr hInstance; public IntPtr hIcon; public IntPtr hCursor; public IntPtr hbrBackground;
+        public string lpszMenuName; public string lpszClassName; public IntPtr hIconSm;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct RECT { public int left, top, right, bottom; }
+    [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern ushort RegisterClassEx(ref WNDCLASSEX c);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CreateWindowEx(uint ex, string cls, string title, uint style, int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr param);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr DefWindowProc(IntPtr h, uint m, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hgt, uint flags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr mon, ref MONITORINFO mi);
+    [DllImport("user32.dll")] static extern IntPtr SetCursor(IntPtr c);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetMessage(out HotKeyApi.MSG m, IntPtr h, uint a, uint b);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool PeekMessage(out HotKeyApi.MSG m, IntPtr h, uint a, uint b, uint remove);
+    [DllImport("user32.dll")] static extern bool TranslateMessage(ref HotKeyApi.MSG m);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr DispatchMessage(ref HotKeyApi.MSG m);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool PostThreadMessage(uint tid, uint m, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string n);
+    [DllImport("gdi32.dll")] static extern IntPtr GetStockObject(int i);
+
+    const uint WM_RUN = 0x8000;   // WM_APP: run the queued jobs
+    const string ClassName = "DdcSwitchBlank";
+    static readonly object gate = new object();
+    static readonly HashSet<string> shown = new HashSet<string>();                    // wanted state, any thread (under gate)
+    static readonly ConcurrentQueue<Action> jobs = new ConcurrentQueue<Action>();
+    static readonly Dictionary<string, IntPtr> windows = new Dictionary<string, IntPtr>();   // overlay thread only
+    static readonly Dictionary<IntPtr, string> names = new Dictionary<IntPtr, string>();     // overlay thread only
+    static WndProc proc;   // held so the GC never collects the delegate Windows calls back
+    static uint threadId;
+
+    public static bool IsShown(string name) { lock (gate) return shown.Contains(name); }
+    public static void Show(string name, long hMonitor) {
+        lock (gate) shown.Add(name);
+        Run(() => Place(name, new IntPtr(hMonitor)));
+    }
+    public static void Hide(string name) {
+        lock (gate) shown.Remove(name);
+        Run(() => {
+            IntPtr h;
+            if (windows.TryGetValue(name, out h)) { windows.Remove(name); names.Remove(h); DestroyWindow(h); }
+        });
+    }
+
+    static void Run(Action job) {
+        lock (gate) {
+            if (threadId == 0) {
+                var ready = new ManualResetEventSlim();
+                var t = new Thread(() => Loop(ready)) { IsBackground = true, Name = "BlankOverlay" };
+                t.Start(); ready.Wait();
+            }
+        }
+        jobs.Enqueue(job);
+        PostThreadMessage(threadId, WM_RUN, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    static void Loop(ManualResetEventSlim ready) {
+        // Per-monitor DPI aware (v2): monitor rects and window positions are both real pixels.
+        try { SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch { }
+        proc = WndProcImpl;
+        var wc = new WNDCLASSEX {
+            cbSize = (uint)Marshal.SizeOf(typeof(WNDCLASSEX)), style = 0x0008 /* CS_DBLCLKS */, lpfnWndProc = proc,
+            hInstance = GetModuleHandle(null), hbrBackground = GetStockObject(4) /* BLACK_BRUSH */, lpszClassName = ClassName
+        };
+        RegisterClassEx(ref wc);
+        HotKeyApi.MSG m;
+        PeekMessage(out m, IntPtr.Zero, 0, 0, 0);   // creates this thread's queue, so PostThreadMessage can reach it
+        threadId = GetCurrentThreadId();
+        ready.Set();
+        while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) {
+            if (m.hwnd == IntPtr.Zero && m.message == WM_RUN) {
+                Action job;
+                while (jobs.TryDequeue(out job)) { try { job(); } catch { } }
+                continue;
+            }
+            TranslateMessage(ref m); DispatchMessage(ref m);
+        }
+    }
+
+    static void Place(string name, IntPtr hMon) {
+        lock (gate) { if (!shown.Contains(name)) return; }   // hidden again before this ran
+        var mi = new MONITORINFO { cbSize = Marshal.SizeOf(typeof(MONITORINFO)) };
+        if (!GetMonitorInfo(hMon, ref mi)) return;
+        var r = mi.rcMonitor; int w = r.right - r.left, h = r.bottom - r.top;
+        IntPtr hwnd;
+        if (!windows.TryGetValue(name, out hwnd)) {
+            // WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW (no taskbar / Alt+Tab) | WS_EX_TOPMOST, WS_POPUP
+            hwnd = CreateWindowEx(0x08000000 | 0x80 | 0x8, ClassName, "DDC Switch blank", 0x80000000, r.left, r.top, w, h, IntPtr.Zero, IntPtr.Zero, GetModuleHandle(null), IntPtr.Zero);
+            if (hwnd == IntPtr.Zero) return;
+            windows[name] = hwnd; names[hwnd] = name;
+        }
+        SetWindowPos(hwnd, new IntPtr(-1) /* HWND_TOPMOST */, r.left, r.top, w, h, 0x0010 | 0x0040 /* NOACTIVATE | SHOWWINDOW */);
+    }
+
+    static IntPtr WndProcImpl(IntPtr h, uint msg, IntPtr w, IntPtr l) {
+        switch (msg) {
+            case 0x0020: SetCursor(IntPtr.Zero); return new IntPtr(1);   // WM_SETCURSOR: no cursor over the black
+            case 0x0021: return new IntPtr(3);                           // WM_MOUSEACTIVATE: MA_NOACTIVATE, the click is swallowed
+            case 0x0203: {                                               // WM_LBUTTONDBLCLK: un-blank (this machine only)
+                string n;
+                if (names.TryGetValue(h, out n)) DdcWorker.Invoke("Invoke-DdcAction", new[] { "Blank:Off@" + n }, null);
+                return IntPtr.Zero;
+            }
+        }
+        return DefWindowProc(h, msg, w, l);
+    }
+}
+// Runs every monitor action and status read, one at a time and in order, on one background thread
+// with its own PowerShell runspace, so the hotkey loop and the wheel never wait on DDC.
+// Each job is a real pipeline (PowerShell.Invoke): calling script delegates directly breaks
+// try/finally in Windows PowerShell 5.1.
+public static class DdcWorker {
+    static readonly BlockingCollection<Action> queue = new BlockingCollection<Action>();
+    static readonly object gate = new object();
+    static System.Management.Automation.Runspaces.Runspace runspace;
+    static string statusTarget; static Action<string> statusDone; static bool statusQueued;
+    public static void Start(System.Management.Automation.Runspaces.Runspace rs) {
+        runspace = rs;
+        var t = new Thread(() => { foreach (var job in queue.GetConsumingEnumerable()) { try { job(); } catch { } } }) { IsBackground = true, Name = "DdcWorker" };
+        t.Start();
+    }
+    static string Call(string command, params string[] args) {
+        using (var ps = System.Management.Automation.PowerShell.Create()) {
+            ps.Runspace = runspace;
+            ps.AddCommand(command);
+            foreach (var a in args) ps.AddArgument(a);
+            var outp = ps.Invoke();
+            var parts = new List<string>();
+            foreach (var o in outp) if (o != null) parts.Add(o.ToString());
+            if (parts.Count == 0 && ps.Streams.Error.Count > 0) return "Error: " + ps.Streams.Error[0].ToString();
+            return string.Join("\n", parts);
+        }
+    }
+    public static void Post(string source, string action, Action<string> done) {
+        queue.Add(() => {
+            string res;
+            try { res = Call("Invoke-WorkerAction", source, action); } catch (Exception ex) { res = "Error: " + ex.Message; }
+            if (done != null) done(res);
+        });
+    }
+    // Any ddc-lib function by name (the tuner uses this), with string arguments.
+    public static void Invoke(string command, string[] args, Action<string> done) {
+        queue.Add(() => {
+            string res;
+            try { res = Call(command, args ?? new string[0]); } catch (Exception ex) { res = "Error: " + ex.Message; }
+            if (done != null) done(res);
+        });
+    }
+    public static string RunSync(string source, string action) {
+        string res = null;
+        using (var ev = new ManualResetEventSlim()) { Post(source, action, r => { res = r; ev.Set(); }); ev.Wait(); }
+        return res;
+    }
+    // Status reads coalesce: only the latest request still waiting is run.
+    public static void Status(string target, Action<string> done) {
+        lock (gate) { statusTarget = target; statusDone = done; if (statusQueued) return; statusQueued = true; }
+        queue.Add(() => {
+            string t; Action<string> d;
+            lock (gate) { t = statusTarget; d = statusDone; statusQueued = false; }
+            string res;
+            try { res = Call("Get-WorkerStatus", t); } catch (Exception ex) { res = "Status error: " + ex.Message; }
+            if (d != null) d(res);
+        });
+    }
+}
 "@ -ErrorAction SilentlyContinue
 
 # Set:<Feature>=+N / -N, optionally @<Monitor>: presses of these can be merged into one bigger step.
@@ -141,6 +338,9 @@ if (@($Bindings.Values | Where-Object { $_.Action -eq 'Wheel' }).Count) {
     try { . (Join-Path $ScriptDir 'ddc-wheel.ps1'); $WheelEnabled = $true }
     catch { Log ("Wheel unavailable: " + $_.Exception.Message) }
 }
+$TunerEnabled = $false
+try { . (Join-Path $ScriptDir 'ddc-tuner.ps1'); $TunerEnabled = $true }
+catch { Log ("Tuner unavailable: " + $_.Exception.Message) }
 
 # --- Peer listener (separate runspace so it can block on Accept) -----------
 $listenerScript = {
@@ -195,43 +395,68 @@ if ($NetworkEnabled) {
     [PeerSender]::Start($LogPath)
 }
 
-# --- Run an action here and on the peer -------------------------------------
-function Send-ToPeer([string]$action) {
-    if (-not $NetworkEnabled) { return }
-    if (-not $PeerHost) { Log "no PeerHost set - not forwarding (edit machine.local.psd1)"; return }
-    [PeerSender]::Send($PeerHost, $Port, $Token, $action)
-}
-
-# Config is re-read per action, so presets/profiles can be edited without a restart.
-function Invoke-Everywhere([string]$action, [string]$source) {
-    try {
-        $results = Invoke-DdcAction -Action $action -Config (Import-Config)   # local: only monitors we own
-        Send-ToPeer $action                                                    # peer: monitors it owns
-        Log ("{0} -> {1} (local): {2}" -f $source, $action, ($results -join ' | '))
-        return $results
-    } catch {
-        Log ("ERROR applying '{0}': {1}" -f $action, $_.Exception.Message)
-        return , ("Error: " + $_.Exception.Message)
-    }
-}
-
-function Open-Wheel($binding, [int]$id) {
-    $wcfg = Import-Config
-    $run = {
-        param($a)
-        $r = Invoke-Everywhere $a 'Wheel'
-        # The overlay has room for a short summary, not the full log line.
+# --- Worker runspace: runs all monitor actions off the hotkey / wheel thread --------
+$workerInit = {
+    param($ScriptDir, $SharedText, $LogPath, $NetworkEnabled, $PeerHost, $Port, $Token)
+    . (Join-Path $ScriptDir 'ddc-lib.ps1')
+    . ([scriptblock]::Create($SharedText))
+    function global:Invoke-WorkerAction([string]$source, [string]$action) {
+        $r = Invoke-Everywhere $action $source
+        # The wheel has room for a short summary, not the full log line.
         (@($r) | ForEach-Object { $_ -replace '^\[(OK|SAME|SKIP|FAIL)\]\s*', '$1: ' }) -join "`n"
     }
-    $status = { param($t) (Get-DdcStatus -Config $wcfg -Target $t) -join "`n" }
-    $picked = Show-DdcWheel -Config $wcfg -Run $run -Status $status -TriggerVk $binding.Vk -HotkeyId $id
-    if ($picked) { [void](Invoke-Everywhere $picked 'Wheel') }
+    function global:Get-WorkerStatus([string]$target) {
+        try { (Get-DdcStatus -Config (Import-Config) -Target $target) -join "`n" } catch { 'Status error: ' + $_.Exception.Message }
+    }
+}
+$wrs = [runspacefactory]::CreateRunspace(); $wrs.Open()
+$psInit = [powershell]::Create(); $psInit.Runspace = $wrs
+[void]$psInit.AddScript($workerInit).AddArgument($ScriptDir).AddArgument($Shared.ToString()).AddArgument($LogPath).AddArgument($NetworkEnabled).AddArgument($PeerHost).AddArgument($Port).AddArgument($Token)
+[void]$psInit.Invoke()
+if ($psInit.HadErrors) { Log ("FATAL: worker init failed: " + ($psInit.Streams.Error | Out-String)); throw 'worker init failed' }
+$psInit.Dispose()
+[DdcWorker]::Start($wrs)
+
+# A monitor blanked when the daemon last stopped has no black window any more but is still at
+# brightness 0: give it its brightness back (on this machine only - not forwarded).
+foreach ($k in @((Read-DdcState).Keys | Where-Object { $_ -like 'Blank|*' })) {
+    $mon = $k.Substring(6)
+    Log "restoring brightness of $mon (was blanked when the daemon stopped)"
+    [DdcWorker]::Invoke('Invoke-DdcAction', [string[]]@("Blank:Off@$mon"), $null)
+}
+
+$WheelRun    = [Action[string, Action[string]]]{ param($a, $cb) [DdcWorker]::Post('Wheel', $a, $cb) }
+$WheelStatus = [Action[string, Action[string]]]{ param($t, $cb) [DdcWorker]::Status($t, $cb) }
+if ($WheelEnabled) {
+    # Build the overlay now and read the monitors once (also caches their capabilities), so the
+    # first Ctrl+Alt+Space opens instantly with live values.
+    try { [DdcWheel]::Warm($WheelStatus) } catch { Log ("Wheel warm-up failed: " + $_.Exception.Message) }
+}
+
+# The picked action (a preset, profile, look) is queued, so the wheel is gone immediately and the
+# hotkey loop is free again while the monitors switch.
+function Open-Wheel($binding, [int]$id) {
+    $picked = Show-DdcWheel -Config (Import-Config) -RunAsync $WheelRun -StatusAsync $WheelStatus -TriggerVk $binding.Vk -HotkeyId $id
+    if ($picked -eq 'Tune') { Open-Tuner }
+    elseif ($picked) { [DdcWorker]::Post('Wheel', $picked, $null) }
+}
+
+# The tuner's reads and writes go through the worker (local monitors only, never forwarded);
+# results come back on this thread's dispatcher. Hotkeys are ignored while it's open.
+function Open-Tuner {
+    if (-not $TunerEnabled) { Log 'Tuner unavailable'; return }
+    $disp = [System.Windows.Threading.Dispatcher]::CurrentDispatcher
+    $call = { param($c, $a, $done) [DdcWorker]::Invoke($c, [string[]]@($a), [UiPost]::Wrap($disp, [Action[string]]$done)) }.GetNewClosure()
+    Log 'Tuner opened'
+    Show-DdcTuner -Call $call
+    Log 'Tuner closed'
 }
 
 # --- Register hotkeys ------------------------------------------------------
 foreach ($id in $Bindings.Keys) {
     $b = $Bindings[$id]
     if ($b.Action -eq 'Wheel' -and -not $WheelEnabled) { continue }
+    if ($b.Action -eq 'Tune' -and -not $TunerEnabled) { continue }
     if ([HotKeyApi]::RegisterHotKey([IntPtr]::Zero, $id, $b.Modifiers, $b.Vk)) {
         Log ("Registered {0} -> {1}" -f $b.Label, $b.Action)
     } else {
@@ -253,8 +478,12 @@ try {
         else {
             if ([HotKeyApi]::GetMessage([ref]$msg, [IntPtr]::Zero, 0, 0) -le 0) { break }
             if ($msg.message -ne $WM_HOTKEY) {
-                [void][HotKeyApi]::TranslateMessage([ref]$msg)
-                [void][HotKeyApi]::DispatchMessage([ref]$msg)
+                # A WPF callback that throws surfaces here. Log it and keep going: letting it escape
+                # ends the loop, and with it every hotkey.
+                try {
+                    [void][HotKeyApi]::TranslateMessage([ref]$msg)
+                    [void][HotKeyApi]::DispatchMessage([ref]$msg)
+                } catch { Log ("UI error (ignored): " + $_.Exception.Message) }
                 continue
             }
             $id = [int]$msg.wParam
@@ -265,6 +494,10 @@ try {
             try { Open-Wheel $b $id } catch { Log ("Wheel error: " + $_.Exception.Message) }
             continue
         }
+        if ($b.Action -eq 'Tune') {
+            try { Open-Tuner } catch { Log ("Tuner error: " + $_.Exception.Message) }
+            continue
+        }
         $action = $b.Action
         if ($action -match $RelativeAction) {
             $count = 1
@@ -273,12 +506,15 @@ try {
             }
             if ($count -gt 1) { $action = 'Set:{0}={1}{2}{3}' -f $Matches[1], $Matches[2], ([int]$Matches[3] * [math]::Min($count, $MaxMerge)), $Matches[4] }
         }
-        [void](Invoke-Everywhere $action ("Hotkey " + $b.Label))
+        [void][DdcWorker]::RunSync(("Hotkey " + $b.Label), $action)
     }
 }
+catch { Log ("FATAL in message loop: " + $_.Exception.Message); throw }
 finally {
     foreach ($id in $Bindings.Keys) { [void][HotKeyApi]::UnregisterHotKey([IntPtr]::Zero, $id) }
-    if ($psListener) { try { $psListener.Stop() } catch { Log ("listener stop failed: " + $_.Exception.Message) } }
     Log "ddc-hotkeys stopped"
-    $mutex.ReleaseMutex()
+    # Stop() would wait forever for the listener's blocking AcceptTcpClient; don't wait for it.
+    if ($psListener) { try { [void]$psListener.BeginStop($null, $null) } catch { Log ("listener stop failed: " + $_.Exception.Message) } }
+    try { $mutex.ReleaseMutex() } catch { $null = $_ }
+    [Environment]::Exit(0)   # the listener runspace's thread would otherwise keep this process alive
 }

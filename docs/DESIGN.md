@@ -117,8 +117,20 @@ A settings press costs an enumeration, a couple of DDC reads and a write per mon
 Relative hotkeys (`+N` / `-N`) are registered without `MOD_NOREPEAT`, so holding them repeats.
 
 ## Wheel
-A WPF window compiled from C# (`ddc-wheel.ps1`) and shown modally on the daemon's own thread, so
-its callbacks can run the PowerShell engine directly. Consequences:
+A WPF window compiled from C# (`ddc-wheel.ps1`), built once at daemon start and re-shown in a nested
+dispatcher frame on the daemon's own thread. It is wheel-sized, not full-screen: a full-screen
+`AllowsTransparency` window is redrawn in software and stutters on a 3440x1440 panel.
+All DDC work (hotkeys, wheel actions, status reads) runs on one `DdcWorker` thread with its own
+runspace, in order, so neither the hotkey loop nor the wheel waits on the monitors. Jobs run as real
+pipelines (`PowerShell.Invoke`): invoking a script delegate directly breaks `try/finally` in
+Windows PowerShell 5.1 (NullReferenceException in `SuspendStoppingPipeline`). Status reads coalesce.
+Applying a profile or look clears saved toggle state, so a later Reading toggle can't restore stale settings.
+Blank (`Blank:On/Off/Toggle`) is a black Win32 window per monitor (`BlankOverlay`, its own thread and
+message loop, per-monitor DPI aware, placed from the HMONITOR the DDC enumeration found) plus raw
+brightness 0. The raw brightness before it is kept in the state file as `Blank|<Monitor>`.
+The CLI has no overlay, so it can only un-blank. A double-click on the black posts `Blank:Off` to the
+worker as a local-only job (not forwarded).
+Other consequences:
 - The daemon's `GetMessage` loop now dispatches non-hotkey messages. Otherwise WPF's hidden windows
   would lose posted messages between uses, and the dispatcher would stall on the next open.
 - While the wheel is open, hotkeys arrive in WPF's message loop. Only the wheel's own hotkey (close)

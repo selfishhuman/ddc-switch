@@ -25,6 +25,11 @@ $Lnk       = Join-Path $Startup 'DDC Switch Hotkeys.lnk'   # older versions auto
 $TaskName  = 'DDC Switch Hotkeys'
 $RuleName  = 'DDC Switch coordination'
 
+# The task may have been moved into a Task Scheduler folder; reuse wherever it lives
+# (the *-ScheduledTask cmdlets default to the root folder and report "file not found" otherwise).
+$Existing  = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Select-Object -First 1
+$TaskPath  = if ($Existing) { $Existing.TaskPath } else { '\' }
+
 # Read the port from config.psd1 (default 58762).
 $Port = 58762
 $cfgPath = Join-Path $ScriptDir 'config.psd1'
@@ -38,9 +43,9 @@ function Test-Admin {
 }
 
 if ($Remove) {
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-        Write-Host "Removed scheduled task '$TaskName'."
+    if ($Existing) {
+        Unregister-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -Confirm:$false
+        Write-Host "Removed scheduled task '$TaskPath$TaskName'."
     } else { Write-Host "No scheduled task found." }
     if (Test-Path $Lnk) { Remove-Item $Lnk -Force; Write-Host "Removed old autostart shortcut: $Lnk" }
     if (Test-Admin) {
@@ -80,9 +85,15 @@ $action    = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wscript.
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
                  -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances Parallel
-Register-ScheduledTask -TaskName $TaskName -Description 'DDC monitor switch hotkeys (ddc-switch)' -Force `
-    -Trigger @($logon, $unlock, $resume) -Action $action -Principal $principal -Settings $settings | Out-Null
-Write-Host "Installed scheduled task '$TaskName' (sign-in, unlock, resume from sleep)."
+try {
+    Register-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -Description 'DDC monitor switch hotkeys (ddc-switch)' -Force `
+        -Trigger @($logon, $unlock, $resume) -Action $action -Principal $principal -Settings $settings -ErrorAction Stop | Out-Null
+} catch {
+    Write-Warning "Could not register '$TaskPath$TaskName': $($_.Exception.Message)"
+    Write-Warning "If the task is in a Task Scheduler folder you created, re-run this script as admin."
+    return
+}
+Write-Host "Installed scheduled task '$TaskPath$TaskName' (sign-in, unlock, resume from sleep)."
 
 # 2) Firewall rule (inbound TCP on the coordination port)
 if (Test-Admin) {
@@ -97,5 +108,5 @@ if (Test-Admin) {
 
 # 3) Start now
 Write-Host "Starting the daemon now..."
-Start-ScheduledTask -TaskName $TaskName
+Start-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName
 Write-Host "Done. Hotkeys are live (see ddc-hotkeys.log)."

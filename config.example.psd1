@@ -44,6 +44,9 @@
     # A block named after a monitor overrides values for that monitor only.
     # 'Reading' gets its own wheel slice and is toggled: switching it on saves the current settings,
     # switching it off restores them. 'Normal' is the fallback when nothing was saved.
+    # 'Normal' (everyday work) and 'Gaming' get their own wheel slices too. They set brightness
+    # and contrast explicitly so they never inherit a dim Reading level, and applying either one
+    # ends Reading. Optional Hint = '...' is shown in the wheel's centre.
     # The F270i has a built-in Reading mode, so Reading selects it. The X340's can't be selected over
     # DDC, and it ignores RGB gains sent over DDC, so its block drops the mode ($null) and switches to
     # the User1 colour preset (set it to warm colours once in the X340's own menu) and dims it.
@@ -52,7 +55,8 @@
             PictureMode = 'Reading'
             'X340 PRO'  = @{ PictureMode = $null; ColorTemp = 'User1'; Brightness = 40 }
         }
-        Normal  = @{ PictureMode = 'Standard'; ColorTemp = '6500K' }
+        Normal  = @{ PictureMode = 'Standard'; ColorTemp = '6500K'; Brightness = 70;  Contrast = 50; Hint = 'work: neutral white' }
+        Gaming  = @{ PictureMode = 'Standard'; ColorTemp = '6500K'; Brightness = 100; Contrast = 60; Hint = 'full brightness, punchier' }
     }
 
     # Saved looks and brightness calibration aren't in this file: `ddc.ps1 save <Name>` and
@@ -60,8 +64,9 @@
 
     # Global hotkeys (daemon). Modifiers: Ctrl, Alt, Shift, Win. Keys: A-Z, 0-9, F1-F24, Space,
     # Up, Down, Left, Right, PageUp, PageDown.
-    # Action: a preset name, 'Wheel' (radial menu), or Set:<Feature>=<Value>[@<Monitor>],
-    # Profile:<Name>[@<Monitor>], Toggle:<Name>[@<Monitor>], Look:<Name>[@<Monitor>].
+    # Action: a preset name, 'Wheel' (radial menu), 'Tune' (tuner window), or Set:<Feature>=<Value>[@<Monitor>],
+    # Profile:<Name>[@<Monitor>], Toggle:<Name>[@<Monitor>], Look:<Name>[@<Monitor>],
+    # Blank:<On|Off|Toggle>[@<Monitor>] (black window + brightness 0; double-click the black to undo).
     # Values: 40, 40%, +10, -10, a name, or Next / Prev for picture mode and colour temp.
     # Relative steps (+10 / -10) repeat while the keys are held; add Repeat = $false to stop that.
     Hotkeys = @(
@@ -73,6 +78,11 @@
         @{ Keys = 'Ctrl+Alt+Up';    Action = 'Set:Brightness=+10' }
         @{ Keys = 'Ctrl+Alt+Down';  Action = 'Set:Brightness=-10' }
         @{ Keys = 'Ctrl+Alt+R';     Action = 'Toggle:Reading' }
+        @{ Keys = 'Ctrl+Alt+N';     Action = 'Profile:Normal' }
+        @{ Keys = 'Ctrl+Alt+G';     Action = 'Profile:Gaming' }
+        @{ Keys = 'Ctrl+Alt+T';     Action = 'Tune' }
+        @{ Keys = 'Ctrl+Alt+X';     Action = 'Blank:Toggle@X340 PRO' }
+        @{ Keys = 'Ctrl+Alt+F';     Action = 'Blank:Toggle@F270i PRO' }
     )
 
     # Coordination between the two daemons. Port + Token must match on both machines.

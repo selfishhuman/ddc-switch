@@ -44,7 +44,7 @@ public class DdcApi {
     [DllImport("dxva2.dll", CharSet = CharSet.Ansi)]
     public static extern bool CapabilitiesRequestAndCapabilitiesReply(IntPtr h, StringBuilder caps, uint length);
 
-    public class Mon { public IntPtr Handle; public int Width; public int Height; public string Desc; }
+    public class Mon { public IntPtr Handle; public IntPtr HMonitor; public int Width; public int Height; public string Desc; }
 
     public static List<Mon> Enumerate() {
         var list = new List<Mon>();
@@ -54,7 +54,7 @@ public class DdcApi {
                 var arr = new PHYSICAL_MONITOR[n];
                 if (GetPhysicalMonitorsFromHMONITOR(hMon, n, arr)) {
                     foreach (var p in arr)
-                        list.Add(new Mon { Handle = p.hPhysicalMonitor, Width = r.right - r.left, Height = r.bottom - r.top, Desc = p.szPhysicalMonitorDescription });
+                        list.Add(new Mon { Handle = p.hPhysicalMonitor, HMonitor = hMon, Width = r.right - r.left, Height = r.bottom - r.top, Desc = p.szPhysicalMonitorDescription });
                 }
             }
             return true;
@@ -154,6 +154,7 @@ function Get-Monitors {
             Height   = $m.Height
             Aspect   = if ($m.Height -gt 0) { [math]::Round($m.Width / $m.Height, 2) } else { 0 }
             Handle   = $m.Handle
+            HMonitor = $m.HMonitor
             Input    = if ($ok) { [int]$cur } else { $null }
             InputHex = if ($ok) { '0x{0:X2}' -f $cur } else { 'n/a' }
             DdcOk    = $ok
@@ -422,6 +423,7 @@ function Import-Config {
     if ($Path -eq $script:ConfigPath) {
         $saved = Read-DdcSaved
         $cfg.Looks = $saved.Looks; $cfg.Calibration = $saved.Calibration
+        $cfg.Profiles = Merge-DdcProfiles $cfg.Profiles $saved.Profiles
     }
     return $cfg
 }
@@ -431,7 +433,27 @@ function Read-DdcSaved {
     $s = if (Test-Path $Path) { Import-PowerShellDataFile -Path $Path } else { @{} }
     if (-not $s.Looks) { $s.Looks = @{} }
     if (-not $s.Calibration) { $s.Calibration = @{} }
+    if (-not $s.Profiles) { $s.Profiles = @{} }
     return $s
+}
+
+# Profiles tuned in the tuner (saved.psd1 -> Profiles) layered over config.psd1's: each tuned
+# monitor block is merged over that profile's block for the monitor, so its values win over the
+# profile's shared ones. A profile only in saved.psd1 is added as is.
+function Merge-DdcProfiles {
+    param($ConfigProfiles, $SavedProfiles)
+    $out = @{}
+    if ($ConfigProfiles) { foreach ($k in $ConfigProfiles.Keys) { $out[$k] = @{} + $ConfigProfiles[$k] } }
+    if (-not $SavedProfiles) { return $out }
+    foreach ($name in $SavedProfiles.Keys) {
+        if (-not $out.ContainsKey($name)) { $out[$name] = @{} }
+        foreach ($mon in $SavedProfiles[$name].Keys) {
+            $block = if ($out[$name][$mon] -is [System.Collections.IDictionary]) { @{} + $out[$name][$mon] } else { @{} }
+            foreach ($f in $SavedProfiles[$name][$mon].Keys) { $block[$f] = $SavedProfiles[$name][$mon][$f] }
+            $out[$name][$mon] = $block
+        }
+    }
+    return $out
 }
 
 # Hashtables / arrays / numbers / strings -> PowerShell data-file text.
@@ -453,7 +475,7 @@ function ConvertTo-Psd1 {
 function Write-DdcSaved {
     param([Parameter(Mandatory)]$Saved, [string]$Path = $script:SavedPath)
     $text = "# Written by ddc-switch (ddc.ps1 save / calibrate). Copy this file to the other machine too.`r`n" +
-            (ConvertTo-Psd1 @{ Looks = $Saved.Looks; Calibration = $Saved.Calibration })
+            (ConvertTo-Psd1 @{ Looks = $Saved.Looks; Calibration = $Saved.Calibration; Profiles = $(if ($Saved.Profiles) { $Saved.Profiles } else { @{} }) })
     Set-Content -Path $Path -Value $text -Encoding UTF8
 }
 
@@ -546,6 +568,8 @@ function Set-Preset {
             # Already on the target input -> do NOT re-send it. Re-selecting the same input
             # forces an HDMI/DP re-handshake (the black flicker) for no reason.
             if ($target.Input -eq $val) { $results += ("[SAME] {0,-12} already {1,-6} (0x{2:X2})" -f $model, $side, $val); continue }
+            # A blanked monitor gets its brightness back first, or the other machine would show at 0.
+            if (Test-DdcBlank $target) { $results += Switch-DdcBlank -Mode Off -Targets @($target) -Config $Config }
             $ok = Set-Input -Handle $target.Handle -Value $val
             $results += ("{0} {1,-12} -> {2,-6} (0x{3:X2})" -f $(if ($ok){'[OK]'}else{'[FAIL]'}), $model, $side, $val)
         }
@@ -560,10 +584,11 @@ function Set-Preset {
 #   Toggle:<Name>[@<Mon>]           apply a profile, or restore what it replaced if it's already on
 #   Look:<Name>[@<Mon>]             apply a saved look (saved.psd1)
 #   Save:<Name>                     save this machine's monitors' current settings as a look
+#   Blank:<On|Off|Toggle>[@<Mon>]   black out a monitor (see Switch-DdcBlank)
 function ConvertFrom-DdcAction {
     param([Parameter(Mandatory)][string]$Action)
     $a = $Action.Trim()
-    if ($a -notmatch '^(Set|Profile|Toggle|Look|Save):(.+)$') { return @{ Kind = 'Preset'; Name = $a } }
+    if ($a -notmatch '^(Set|Profile|Toggle|Look|Save|Blank):(.+)$') { return @{ Kind = 'Preset'; Name = $a } }
     $kind = $Matches[1]; $body = $Matches[2]; $target = 'All'
     $at = $body.LastIndexOf('@')
     if ($at -ge 0) { $target = $body.Substring($at + 1).Trim(); $body = $body.Substring(0, $at) }
@@ -644,6 +669,16 @@ function Write-DdcState {
     $State | ConvertTo-Json -Depth 4 | Set-Content -Path $script:StatePath -Encoding UTF8
 }
 
+# Forget the settings toggles saved for these monitors ("<Profile>|<Monitor>" keys in the state file).
+function Clear-DdcToggleState {
+    param($Monitors)
+    $state = Read-DdcState
+    $drop = @(foreach ($m in @($Monitors)) { $state.Keys | Where-Object { $_.EndsWith("|$($m.Model)") } })
+    if (-not $drop.Count) { return }
+    foreach ($k in $drop) { $state.Remove($k) }
+    Write-DdcState $state
+}
+
 # Toggle a profile on this machine's target monitors. If any of them already shows the profile,
 # all of them go back to the settings saved when it was switched on (or to the 'Normal' profile
 # when nothing was saved, e.g. it was switched on from the other machine). Otherwise the current
@@ -688,6 +723,55 @@ function Switch-DdcProfile {
     return $results
 }
 
+# Blanking: a black window over the monitor plus raw brightness 0 (below the calibrated minimum),
+# so the panel is as dark as it gets while it keeps its signal and still answers DDC. The window
+# is drawn by the daemon ([BlankOverlay] in ddc-hotkeys.ps1); without it (the CLI) a monitor can
+# only be un-blanked. The brightness it had is kept in the state file ("Blank|<Monitor>") and put
+# back on un-blank, even after a daemon restart.
+function Test-DdcBlank {
+    param([Parameter(Mandatory)]$Monitor, $State)
+    if ($null -eq $State) { $State = Read-DdcState }
+    $overlay = 'BlankOverlay' -as [type]
+    return [bool]($State.ContainsKey("Blank|$($Monitor.Model)") -or ($overlay -and $overlay::IsShown([string]$Monitor.Model)))
+}
+
+# Toggle blanks every target if none is blanked, otherwise un-blanks them all (like Switch-DdcProfile).
+function Switch-DdcBlank {
+    param([Parameter(Mandatory)][ValidateSet('On', 'Off', 'Toggle')][string]$Mode, [Parameter(Mandatory)]$Targets, $Config)
+    $overlay = 'BlankOverlay' -as [type]
+    $state = Read-DdcState
+    $on = if ($Mode -eq 'Toggle') { -not @($Targets | Where-Object { Test-DdcBlank $_ $state }).Count } else { $Mode -eq 'On' }
+    $results = @()
+    foreach ($m in $Targets) {
+        $key = "Blank|$($m.Model)"
+        $code = Get-FeatureCode -Feature Brightness -Config $Config -MonitorName $m.Model
+        if ($on) {
+            if (-not $overlay) { $results += "[SKIP] $($m.Model): blanking needs the daemon (use its hotkey or the wheel)"; continue }
+            $note = 'already blank'
+            if (-not $state.ContainsKey($key)) {
+                $b = Get-Vcp -Handle $m.Handle -Code $code
+                if ($b.Ok) {
+                    $state[$key] = [ordered]@{ Brightness = [string]$b.Current }
+                    $note = "brightness $($b.Current) -> 0"
+                    [void](Set-Vcp -Handle $m.Handle -Code $code -Value 0)
+                } else { $note = 'brightness unreadable, left as is' }
+            }
+            $overlay::Show([string]$m.Model, [long]$m.HMonitor)
+            $results += "[Blank on] $($m.Model): $note"
+        } else {
+            if ($overlay) { $overlay::Hide([string]$m.Model) }
+            if ($state.ContainsKey($key)) {
+                $raw = [int]$state[$key]['Brightness']
+                $ok = Set-Vcp -Handle $m.Handle -Code $code -Value $raw
+                $state.Remove($key)
+                $results += "$(if ($ok) { '[Blank off]' } else { '[FAIL] Blank off' }) $($m.Model): brightness back to $raw"
+            } else { $results += "[Blank off] $($m.Model)" }
+        }
+    }
+    Write-DdcState $state
+    return $results
+}
+
 # Run an action string (see ConvertFrom-DdcAction) on the monitors this machine owns.
 # Returns result strings for logging. Unknown presets, features and profiles are rejected.
 function Invoke-DdcAction {
@@ -706,12 +790,16 @@ function Invoke-DdcAction {
     if ($a.Kind -in 'Profile', 'Toggle' -and -not ($Config.Profiles -and $Config.Profiles.ContainsKey($a.Name))) {
         throw "Profile '$($a.Name)' not found. Have: $(if ($Config.Profiles) { @($Config.Profiles.Keys) -join ', ' })"
     }
+    if ($a.Kind -eq 'Blank' -and $a.Name -notin 'On', 'Off', 'Toggle') { throw "Bad action '$Action' (use Blank:On, Blank:Off or Blank:Toggle, optionally @<Monitor>)" }
 
     $opened = -not $Monitors
     if ($opened) { $Monitors = Get-Monitors -Rules $Config.Monitors }
     try {
         $targets = @(Select-TargetMonitor $Monitors $a.Target)   # @(): one monitor comes back unwrapped, and PS 5.1 objects have no .Count
         if (-not $targets.Count) { return , "[SKIP] no monitor$(if ($a.Target -ne 'All') { " '$($a.Target)'" }) on this machine's active input" }
+        # Picking a profile or look replaces whatever a toggle (e.g. Reading) switched on, so forget
+        # what that toggle saved: otherwise toggling it later would "restore" those older settings.
+        if ($a.Kind -in 'Profile', 'Look') { Clear-DdcToggleState $targets }
         switch ($a.Kind) {
             'Set' {
                 foreach ($m in $targets) { Set-MonitorFeature -Monitor $m -Feature $a.Feature -Value $a.Value -Config $Config -Caps (Get-MonitorCapabilities $m) }
@@ -720,6 +808,7 @@ function Invoke-DdcAction {
                 foreach ($m in $targets) { Set-MonitorSetting $m (Get-ProfileSetting $Config.Profiles[$a.Name] $m.Model) $Config }
             }
             'Toggle' { Switch-DdcProfile -Name $a.Name -Targets $targets -Config $Config }
+            'Blank'  { Switch-DdcBlank -Mode $a.Name -Targets $targets -Config $Config }
             'Look' {
                 $look = $Config.Looks[$a.Name]
                 foreach ($m in $targets) {
@@ -729,6 +818,92 @@ function Invoke-DdcAction {
             }
         }
     } finally { if ($opened) { Close-Monitors $Monitors } }
+}
+
+# ---- Tuner (ddc-tuner.ps1) ----
+# Features the tuner shows, in display order.
+$script:TuneFeatures = @('PictureMode', 'ColorTemp', 'Brightness', 'Contrast', 'RedGain', 'GreenGain', 'BlueGain')
+
+# JSON for the tuner: every configured monitor, and for each one this machine can reach, the
+# current value, range or choices of each tunable feature it supports. Brightness is on the
+# calibrated 0-100 scale when calibrated.
+function Get-DdcTuneState {
+    param($Config)
+    if (-not $Config) { $Config = Import-Config }
+    $mons = Get-Monitors -Rules $Config.Monitors
+    try {
+        $reach = @{}
+        foreach ($m in (Select-TargetMonitor $mons 'All')) { $reach[$m.Model] = $m }
+        $list = foreach ($rule in @($Config.Monitors | Where-Object { $_ })) {
+            $name = [string]$rule.Name
+            $m = $reach[$name]
+            if (-not $m) { [ordered]@{ Name = $name; Reachable = $false }; continue }
+            $caps = Get-MonitorCapabilities $m
+            $feats = [ordered]@{}
+            foreach ($f in $script:TuneFeatures) {
+                $v = Get-MonitorFeatureValue -Monitor $m -Feature $f -Config $Config -Caps $caps
+                if (-not $v.Ok) { continue }
+                if ($script:Features[$f].Kind -eq 'List') {
+                    $names = Get-FeatureValueNames -Feature $f -Config $Config -MonitorName $name
+                    $code = Get-FeatureCode -Feature $f -Config $Config -MonitorName $name
+                    $allowed = if ($null -ne $caps -and $caps[$code]) { @($caps[$code]) } else { @() }
+                    $opts = @(foreach ($k in $names.Keys) { if (-not $allowed.Count -or $names[$k] -in $allowed) { $k } })
+                    $feats[$f] = [ordered]@{ Value = (Get-FeatureValueName $names $v.Value); Options = $opts }
+                } else {
+                    $max = if (Get-FeatureCurve -Feature $f -Config $Config -MonitorName $name) { 100 } else { $v.Max }
+                    $feats[$f] = [ordered]@{ Value = $v.Value; Max = $max }
+                }
+            }
+            [ordered]@{ Name = $name; Reachable = $true; Features = $feats }
+        }
+        $profiles = @(if ($Config.Profiles) { $Config.Profiles.Keys | Sort-Object })
+        return ([ordered]@{ Monitors = @($list); Profiles = $profiles } | ConvertTo-Json -Depth 6 -Compress)
+    } finally { Close-Monitors $mons }
+}
+
+# '{"X340 PRO":{"Brightness":"60"}}' -> @{ 'X340 PRO' = [ordered]@{ Brightness = '60' } }
+function ConvertFrom-TuneJson {
+    param([string]$Json)
+    $h = @{}
+    $obj = $Json | ConvertFrom-Json
+    foreach ($p in $obj.PSObject.Properties) {
+        $s = [ordered]@{}
+        foreach ($q in $p.Value.PSObject.Properties) { if ($script:Features.Contains($q.Name)) { $s[$q.Name] = [string]$q.Value } }
+        $h[$p.Name] = $s
+    }
+    return $h
+}
+
+# Apply per-monitor settings (tuner preview / revert) to the monitors this machine can reach.
+function Set-DdcTuneSettings {
+    param([Parameter(Mandatory)][string]$Json, $Config)
+    if (-not $Config) { $Config = Import-Config }
+    $want = ConvertFrom-TuneJson $Json
+    $mons = Get-Monitors -Rules $Config.Monitors
+    try {
+        $out = foreach ($m in (Select-TargetMonitor $mons 'All')) {
+            if ($want.ContainsKey($m.Model) -and $want[$m.Model].Count) { Set-MonitorSetting $m $want[$m.Model] $Config }
+        }
+        return (@($out) -join "`n")
+    } finally { Close-Monitors $mons }
+}
+
+# Save tuned per-monitor settings as a profile in saved.psd1 (merged over config.psd1's profile).
+# Monitors not in $Json keep what was saved for them before.
+function Save-DdcTuneProfile {
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Json)
+    if ($Name -notmatch '^[\w][\w \-]{0,31}$') { throw "Bad profile name '$Name' (letters, digits, space, - and _, up to 32)" }
+    $vals = ConvertFrom-TuneJson $Json
+    $saved = Read-DdcSaved
+    $prof = if ($saved.Profiles[$Name]) { $saved.Profiles[$Name] } else { @{} }
+    foreach ($mon in $vals.Keys) {
+        $block = @{}
+        foreach ($f in $vals[$mon].Keys) { $v = $vals[$mon][$f]; $block[$f] = if ($v -match '^\d+$') { [int]$v } else { $v } }
+        $prof[$mon] = $block
+    }
+    $saved.Profiles[$Name] = $prof
+    Write-DdcSaved $saved
+    return "Saved '$Name' for $(@($vals.Keys) -join ' + ')"
 }
 
 # One line per monitor with its current picture settings (only what it supports), for the

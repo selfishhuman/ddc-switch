@@ -21,6 +21,8 @@
       ddc.ps1 calibrate [Brightness]        # match both monitors by eye at 3 levels (both must show this machine)
       ddc.ps1 do "<Action>"                 # any action string, e.g. "Set:Brightness=+10@X340 PRO"
       ddc.ps1 wheel                         # open the radial menu here (local only, no forwarding)
+      ddc.ps1 tune [Profile]                # tuner window: adjust each monitor live, save into a profile
+      ddc.ps1 blank off ["<Monitor>"]       # give a blanked monitor its brightness back (blanking itself is daemon-only)
 
     The CLI only touches the monitors on THIS machine's active inputs; hotkeys and the wheel in the
     daemon also forward to the other machine.
@@ -47,6 +49,17 @@ function Get-ConfigRules {
     if (Test-Path $script:ConfigPath) { return (Import-Config).Monitors }
     Write-Host "  (no config yet at $script:ConfigPath - showing raw monitors; copy config.example.psd1 to config.psd1)"
     return @()
+}
+
+# The tuner run directly (no daemon worker): each call blocks the window briefly while it runs.
+function Open-CliTuner([string]$StartProfile) {
+    . (Join-Path $ScriptDir 'ddc-tuner.ps1')
+    $call = {
+        param($c, $a, $done)
+        $r = try { (& $c @a) -join "`n" } catch { 'Error: ' + $_.Exception.Message }
+        & $done ([string]$r)
+    }
+    Show-DdcTuner -Call $call -StartProfile $StartProfile
 }
 
 function Invoke-AndShow([string]$Action) {
@@ -287,8 +300,19 @@ switch ($Command.ToLower()) {
         $run = { param($a) (Invoke-DdcAction -Action $a -Config $cfg) -join "`n" }
         $status = { param($t) (Get-DdcStatus -Config $cfg -Target $t) -join "`n" }
         $picked = Show-DdcWheel -Config $cfg -Run $run -Status $status
-        if ($picked) { Invoke-AndShow $picked }
+        if ($picked -eq 'Tune') { Open-CliTuner }
+        elseif ($picked) { Invoke-AndShow $picked }
     }
 
-    default { Write-Host "Unknown command '$Command'. Use: list | preset | set | capture | status | caps | brightness | contrast | volume | mode | colortemp | reading | profile | save | look | looks | forget | calibrate | do | wheel" }
+    'tune' { Open-CliTuner $Arg1 }
+
+    'blank' {
+        # Blanking itself needs the daemon (it draws the black window); here `blank off` still
+        # gives a monitor its brightness back, e.g. if the daemon stopped while it was blanked.
+        $mode = if ($Arg1) { $Arg1 } else { 'Off' }
+        if ($mode -notin 'On', 'Off', 'Toggle') { throw "Usage: ddc.ps1 blank [on|off|toggle] [`"<Monitor>`"]" }
+        Invoke-AndShow ("Blank:$mode" + $(if ($Arg2) { "@$Arg2" }))
+    }
+
+    default { Write-Host "Unknown command '$Command'. Use: list | preset | set | capture | status | caps | brightness | contrast | volume | mode | colortemp | reading | profile | save | look | looks | forget | calibrate | do | wheel | tune | blank" }
 }

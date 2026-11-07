@@ -173,20 +173,53 @@ Safety rules, enforced in `Set-MonitorFeature`:
 - Writes are spaced out, as MCCS requires.
 
 ## Wheel
-Hold **`Ctrl+Alt+Space`**. A dimmed overlay with a radial menu appears on the monitor under your mouse.
-- **Hold, point, release** picks the slice you're pointing at. **Tap** the hotkey instead to keep it open and click.
-- Slices: Layout (presets), Looks, Brightness, Colour temp, Reading, Profiles. Contrast, picture mode,
+Hold **`Ctrl+Alt+Space`**. A radial menu opens centred on your mouse.
+- **Hold, flick, release** picks the slice you're pointing at; releasing in the centre cancels.
+  **Tap** the hotkey instead to keep it open and click, or press `1`-`9`.
+- Slices: Layout (presets), Normal, Gaming, Reading, Brightness, Colour, Looks (plus Profiles for any
+  other profiles). **Normal** (`Ctrl+Alt+N`) is everyday work: 6500K, brightness 70. **Gaming**
+  (`Ctrl+Alt+G`) is full brightness with a bit more contrast. Both set brightness explicitly and end
+  Reading. Colour leaves out the User presets, which are tuned for Reading. Contrast, picture mode,
   volume and mute are left off (unsupported or counter-productive on these monitors) but still work
   as hotkey and `ddc.ps1` actions.
 - With target **All**, Colour temp offers only the choices every monitor has. Target a single monitor
   to see all of its own presets.
 - **Scroll** over Brightness (or anywhere inside its submenu) to adjust in steps of 5.
-- **Click the centre** to choose which monitor settings apply to (All / each monitor).
+- **Click the centre** (or Tab) to choose which monitor settings apply to (All / each monitor).
 - **Right-click** or Backspace goes back. Esc, clicking off or the hotkey again closes it.
 - Below the wheel: live values for this machine's monitors and the result of the last change.
 
-Settings slices stay open so you can keep tuning. Layout and Reading close the wheel when picked.
+Settings slices stay open so you can keep tuning. Layout, Normal, Gaming, Reading and Looks close the wheel when picked.
 `ddc.ps1 wheel` opens it from a terminal for testing; that version is local only, with no forwarding.
+
+## Tuner
+**`Ctrl+Alt+T`** (or the wheel's Tune slice, or `ddc.ps1 tune`) opens a window with a card per monitor:
+picture mode, colour preset, brightness, contrast and red / green / blue.
+1. Click a profile (Normal, Gaming, Reading, or type a name and **+ New profile**). An existing one is
+   applied so you start from it.
+2. Drag and click until it looks right. Changes show on the monitors live. Tick *Move both monitors'
+   brightness and contrast together* to keep them matched.
+3. **Save** stores it in `saved.psd1` -> `Profiles`, layered over `config.psd1`'s profile, so Ctrl+Alt+N /
+   G, the wheel and Reading use it from then on. **Revert**, or closing without saving, puts the
+   monitors back.
+
+Only monitors showing this machine can be tuned. Tune the others from the other machine, or switch
+them over first. Copy `saved.psd1` to the other machine afterwards. Hotkeys are paused while the tuner is open.
+
+## Blank
+**`Ctrl+Alt+X`** (X340) / **`Ctrl+Alt+F`** (F270i), or the wheel's Blank slice, blacks out one monitor
+and brings it back. The machine showing that monitor covers it with a black window (it takes no focus,
+swallows clicks and hides the cursor) and drops its brightness to raw 0, so the backlight is as low
+as it goes. The monitor stays on, keeps its signal and still takes DDC, so switching and settings
+keep working. **Double-click** the black to bring it back as well.
+
+- The previous brightness is kept in `state.local.json` and restored on un-blank. Switching a blanked
+  monitor to the other machine un-blanks it first, so it never shows up there at brightness 0.
+- If the daemon stops while a monitor is blanked, the next start restores its brightness;
+  `ddc.ps1 blank off ["<Monitor>"]` does the same by hand.
+- It's not a real power-off: the panel still glows faintly, and it still draws some power.
+  DDC power mode (`0xD6`) isn't used: hard off (`05`) leaves the monitor deaf to DDC until its
+  power button is pressed.
 
 ## CLI
 ```powershell
@@ -205,6 +238,7 @@ ddc.ps1 reading ["<Monitor>"]     # toggle the Reading profile
 ddc.ps1 profile <Name> ["<Monitor>"]
 ddc.ps1 do "<Action>"             # any action string
 ddc.ps1 wheel                     # open the wheel here (local only)
+ddc.ps1 blank off ["<Monitor>"]   # give a blanked monitor its brightness back (blanking itself needs the daemon)
 ```
 The CLI only changes monitors on this machine's active inputs. Hotkeys and the wheel also forward to the peer.
 

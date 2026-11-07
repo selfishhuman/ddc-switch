@@ -192,6 +192,38 @@ Describe 'ConvertFrom-DdcAction' {
     It 'rejects a malformed Set' {
         { ConvertFrom-DdcAction 'Set:Brightness' } | Should -Throw '*Set:<Feature>=<Value>*'
     }
+    It 'parses Blank with a target monitor' {
+        $a = ConvertFrom-DdcAction 'Blank:Toggle@X340 PRO'
+        $a.Kind | Should -Be 'Blank'; $a.Name | Should -Be 'Toggle'; $a.Target | Should -Be 'X340 PRO'
+    }
+}
+
+Describe 'Switch-DdcBlank' {
+    # No daemon here, so no [BlankOverlay]: blanking is refused, un-blanking still restores brightness.
+    BeforeEach {
+        $script:StatePath = Join-Path $TestDrive 'state.json'
+        if (Test-Path $script:StatePath) { Remove-Item $script:StatePath }
+        $script:Vcp = @{ 0x10 = 0 }
+        Mock Get-Vcp { [PSCustomObject]@{ Ok = $true; Current = $script:Vcp[$Code]; Max = 100 } }
+        Mock Set-Vcp { $script:Vcp[$Code] = $Value; $true }
+        $script:Mon = [PSCustomObject]@{ Model = 'Wide'; Handle = [IntPtr]::Zero; HMonitor = [IntPtr]::Zero; DdcOk = $true }
+        $script:Cfg = @{ Monitors = @( @{ Name = 'Wide'; Match = @{} } ) }
+    }
+    It 'restores the saved raw brightness and forgets it' {
+        Write-DdcState @{ 'Blank|Wide' = @{ Brightness = '64' } }
+        Switch-DdcBlank -Mode Toggle -Targets @($script:Mon) -Config $script:Cfg | Should -Match 'back to 64'
+        $script:Vcp[0x10] | Should -Be 64
+        (Read-DdcState).ContainsKey('Blank|Wide') | Should -BeFalse
+    }
+    It 'refuses to blank without the daemon and leaves brightness alone' {
+        $script:Vcp[0x10] = 50
+        Switch-DdcBlank -Mode On -Targets @($script:Mon) -Config $script:Cfg | Should -Match 'needs the daemon'
+        $script:Vcp[0x10] | Should -Be 50
+        (Read-DdcState).ContainsKey('Blank|Wide') | Should -BeFalse
+    }
+    It 'rejects an unknown mode' {
+        { Invoke-DdcAction -Action 'Blank:Maybe' -Config $script:Cfg -Monitors @() } | Should -Throw '*Blank:On, Blank:Off or Blank:Toggle*'
+    }
 }
 
 Describe 'Resolve-FeatureValue' {
@@ -430,7 +462,7 @@ Describe 'Import-Config' {
         @($cfg.Monitors).Count | Should -BeGreaterThan 0
         foreach ($h in $cfg.Hotkeys) { { ConvertTo-HotKey $h.Keys } | Should -Not -Throw }
         foreach ($h in $cfg.Hotkeys) {
-            if ($h.Action -eq 'Wheel') { continue }
+            if ($h.Action -in 'Wheel', 'Tune') { continue }
             $a = ConvertFrom-DdcAction $h.Action
             switch ($a.Kind) {
                 'Preset' { $cfg.Presets.Keys | Should -Contain $a.Name }
@@ -439,7 +471,7 @@ Describe 'Import-Config' {
             }
         }
         $names = @($cfg.Monitors | ForEach-Object { $_.Name })
-        foreach ($p in $cfg.Profiles.Values) { foreach ($k in $p.Keys) { @($script:Features.Keys) + $names | Should -Contain $k } }
+        foreach ($p in $cfg.Profiles.Values) { foreach ($k in $p.Keys) { @($script:Features.Keys) + $names + 'Hint' | Should -Contain $k } }
         Test-NetworkToken $cfg.Network.Token | Should -BeFalse   # placeholder must never pass
     }
     It 'does not treat PictureModes / ColorTemps as input sides' {
@@ -456,5 +488,42 @@ Describe 'Import-Config' {
     }
     It 'points at the example when the config is missing' {
         { Import-Config -Path (Join-Path $TestDrive 'missing.psd1') } | Should -Throw '*config.example.psd1*'
+    }
+}
+
+Describe 'Clear-DdcToggleState' {
+    It 'forgets only the toggles saved for the given monitors' {
+        $script:StatePath = Join-Path $TestDrive 'state.json'
+        Write-DdcState @{ 'Reading|Wide' = @{ Brightness = '0' }; 'Reading|Std' = @{ Brightness = '5' } }
+        Clear-DdcToggleState @([PSCustomObject]@{ Model = 'Wide' })
+        $s = Read-DdcState
+        $s.Keys | Should -Not -Contain 'Reading|Wide'
+        $s.Keys | Should -Contain 'Reading|Std'
+    }
+}
+
+Describe 'Merge-DdcProfiles' {
+    It 'layers tuned monitor blocks over the config profile without changing it' {
+        $cfgP = @{ Normal = @{ ColorTemp = '6500K'; Brightness = 70 }; Gaming = @{ Brightness = 100 } }
+        $m = Merge-DdcProfiles $cfgP @{ Normal = @{ Wide = @{ Brightness = 55 } }; Night = @{ Wide = @{ Brightness = 10 } } }
+        (Get-ProfileSetting $m.Normal 'Wide')['Brightness'] | Should -Be '55'
+        (Get-ProfileSetting $m.Normal 'Wide')['ColorTemp'] | Should -Be '6500K'
+        (Get-ProfileSetting $m.Normal 'Std')['Brightness'] | Should -Be '70'
+        (Get-ProfileSetting $m.Night 'Wide')['Brightness'] | Should -Be '10'
+        $cfgP.Normal.ContainsKey('Wide') | Should -BeFalse
+    }
+}
+
+Describe 'Save-DdcTuneProfile' {
+    It 'keeps looks and other monitors when saving one monitor' {
+        $script:SavedPath = Join-Path $TestDrive 'saved.psd1'
+        Write-DdcSaved @{ Looks = @{ L = @{ Wide = @{ Brightness = 1 } } }; Calibration = @{}; Profiles = @{} }
+        Save-DdcTuneProfile 'Normal' '{"Wide":{"Brightness":"40","ColorTemp":"6500K"}}' | Out-Null
+        Save-DdcTuneProfile 'Normal' '{"Std":{"Brightness":"45"}}' | Out-Null
+        $s = Read-DdcSaved
+        $s.Looks.Keys | Should -Contain 'L'
+        $s.Profiles.Normal.Wide.Brightness | Should -Be 40
+        $s.Profiles.Normal.Wide.ColorTemp | Should -Be '6500K'
+        $s.Profiles.Normal.Std.Brightness | Should -Be 45
     }
 }
