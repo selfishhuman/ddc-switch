@@ -236,11 +236,11 @@ function Show-DdcTuner {
         $rb = New-Object Windows.Controls.RadioButton
         $rb.Style = $win.FindResource('Chip'); $rb.Content = $name; $rb.GroupName = 'profile'; $rb.Tag = $name
         $rb.IsChecked = ($name -eq $st.Profile)
-        $rb.Add_Checked({ param($src, $evt) if (-not $st.Loading) { Select-Profile ([string]$src.Tag) } })
+        $rb.Add_Checked({ param($src) if (-not $st.Loading) { Select-Profile ([string]$src.Tag) } })
         [void]$ui.ProfilePanel.Children.Add($rb)
     }
 
-    function Build-ProfileChips {
+    function Update-ProfileChips {
         $st.Loading = $true
         try {
             $ui.ProfilePanel.Children.Clear()
@@ -254,7 +254,7 @@ function Show-DdcTuner {
     function Select-Profile([string]$name) {
         if ($st.Dirty -and $st.Profile -and $st.Profile -ne $name) {
             $ans = [Windows.MessageBox]::Show($win, "Discard your unsaved changes to '$($st.Profile)'?", 'Monitor tuner', 'YesNo', 'Question')
-            if ($ans -ne 'Yes') { Build-ProfileChips; return }
+            if ($ans -ne 'Yes') { Update-ProfileChips; return }
         }
         $st.Profile = $name
         if ($st.Profiles -notcontains $name) { $st.Dirty = $true; Update-Buttons; Set-Status "New profile '$name': tune, then Save."; return }
@@ -282,12 +282,12 @@ function Show-DdcTuner {
         if ($null -eq $st.Snapshot) { $st.Snapshot = Get-StateValues $s }
         $st.Profiles = @($s.Profiles)
         $st.Reachable = @($s.Monitors | Where-Object { $_.Reachable } | ForEach-Object { $_.Name })
-        if ($ui.ProfilePanel.Children.Count -eq 0) { Build-ProfileChips }
+        if ($ui.ProfilePanel.Children.Count -eq 0) { Update-ProfileChips }
         $sig = (@($s.Monitors) | ForEach-Object {
             $m = $_
             "$($m.Name):$($m.Reachable):" + $(if ($m.Features) { (@($m.Features.PSObject.Properties) | ForEach-Object { $_.Name + '=' + (@($_.Value.Options) -join '/') + '/' + $_.Value.Max }) -join ',' })
         }) -join ';'
-        if ($sig -ne $st.Sig) { Build-Cards $s; $st.Sig = $sig }
+        if ($sig -ne $st.Sig) { Update-Cards $s; $st.Sig = $sig }
         $st.Loading = $true
         try {
             foreach ($m in @($s.Monitors)) {
@@ -312,7 +312,7 @@ function Show-DdcTuner {
         return $t
     }
 
-    function Build-Cards($s) {
+    function Update-Cards($s) {
         $ui.Cards.Children.Clear(); $st.Ctl = @{}
         $ui.Cards.Columns = [Math]::Max(1, @($s.Monitors).Count)
         foreach ($m in @($s.Monitors)) {
@@ -337,7 +337,7 @@ function Show-DdcTuner {
                         $rb = New-Object Windows.Controls.RadioButton
                         $rb.Style = $win.FindResource('Chip'); $rb.Content = [string]$o; $rb.GroupName = $key
                         $rb.Tag = @{ Mon = $m.Name; Feature = $f; Value = [string]$o }
-                        $rb.Add_Checked({ param($src, $evt) if ($st.Loading) { return }; $t = $src.Tag; Add-Change $t.Mon $t.Feature $t.Value $true })
+                        $rb.Add_Checked({ param($src) if ($st.Loading) { return }; $t = $src.Tag; Add-Change $t.Mon $t.Feature $t.Value $true })
                         [void]$wrap.Children.Add($rb); $chips += $rb
                     }
                     [void]$sp.Children.Add($wrap)
@@ -359,7 +359,7 @@ function Show-DdcTuner {
                     [void]$sp.Children.Add($g)
                     $st.Ctl[$key] = @{ Kind = 'Range'; Slider = $sl; Label = $val }
                     $sl.Add_ValueChanged({
-                        param($src, $evt)
+                        param($src)
                         $t = $src.Tag
                         $v = [int]$src.Value
                         $st.Ctl["$($t.Mon)|$($t.Feature)"].Label.Text = [string]$v
@@ -416,7 +416,7 @@ function Show-DdcTuner {
         $json = $vals | ConvertTo-Json -Compress -Depth 4
         $name = $st.Profile
         $st.Pending = @{}; $timer.Stop()
-        & $Call 'Set-DdcTuneSettings' @($json) { param($r) }   # make sure the monitors show exactly what's saved
+        & $Call 'Set-DdcTuneSettings' @($json) { }   # make sure the monitors show exactly what's saved
         & $Call 'Save-DdcTuneProfile' @($name, $json) {
             param($r)
             if (-not $st.Closing) { Set-Status ($r + '. Copy saved.psd1 to the other machine too.') }
@@ -431,7 +431,6 @@ function Show-DdcTuner {
         $st.Pending = @{}; $timer.Stop()
         $json = $st.Snapshot | ConvertTo-Json -Compress -Depth 4
         & $Call 'Set-DdcTuneSettings' @($json) {
-            param($r)
             if (-not $st.Closing) { Set-Status $message; Request-State }
         }
         $st.Dirty = $false
@@ -449,9 +448,9 @@ function Show-DdcTuner {
     $ui.SaveBtn.Add_Click({ Save-Current })
     $ui.RevertBtn.Add_Click({ Undo-Changes 'Reverted to how the monitors were.' })
     $ui.CloseBtn.Add_Click({ $win.Close() })
-    $win.Add_KeyDown({ param($src, $evt) if ($evt.Key -eq 'Escape') { $win.Close() } })
+    $win.Add_KeyDown({ if ($args[1].Key -eq 'Escape') { $win.Close() } })
     $win.Add_Closing({
-        param($src, $evt)
+        $evt = $args[1]   # CancelEventArgs
         $timer.Stop()
         if ($st.Dirty) {
             $q = if ($st.Profile) { "Save your changes to '$($st.Profile)'?`n`nNo puts the monitors back how they were." } else { "Keep these settings on the monitors?`n`nNo puts them back how they were. (Pick a profile to save them.)" }

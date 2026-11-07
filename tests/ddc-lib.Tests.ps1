@@ -467,6 +467,8 @@ Describe 'Import-Config' {
             switch ($a.Kind) {
                 'Preset' { $cfg.Presets.Keys | Should -Contain $a.Name }
                 'Set'    { $script:Features.Keys | Should -Contain $a.Feature }
+                'Blank'  { $a.Name | Should -BeIn 'On', 'Off', 'Toggle' }
+                'Look'   { }   # saved looks live in saved.psd1, not the config
                 default  { $cfg.Profiles.Keys | Should -Contain $a.Name }
             }
         }

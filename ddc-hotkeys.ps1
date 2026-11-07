@@ -398,6 +398,8 @@ if ($NetworkEnabled) {
 # --- Worker runspace: runs all monitor actions off the hotkey / wheel thread --------
 $workerInit = {
     param($ScriptDir, $SharedText, $LogPath, $NetworkEnabled, $PeerHost, $Port, $Token)
+    # The shared helpers (Log, Invoke-Everywhere, ...) read these from this scope; touch them so the analyzer sees them used.
+    $null = $LogPath, $NetworkEnabled, $PeerHost, $Port, $Token
     . (Join-Path $ScriptDir 'ddc-lib.ps1')
     . ([scriptblock]::Create($SharedText))
     function global:Invoke-WorkerAction([string]$source, [string]$action) {
